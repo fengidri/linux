@@ -34,6 +34,9 @@ static void vp_transport_features(struct virtio_device *vdev, u64 features)
 	if ((features & BIT_ULL(VIRTIO_F_SR_IOV)) &&
 			pci_find_ext_capability(pci_dev, PCI_EXT_CAP_ID_SRIOV))
 		__virtio_set_bit(vdev, VIRTIO_F_SR_IOV);
+
+	if (features & BIT_ULL(VIRTIO_F_RING_RESET))
+		__virtio_set_bit(vdev, VIRTIO_F_RING_RESET);
 }
 
 /* virtio config->finalize_features() implementation */
@@ -174,6 +177,78 @@ static void vp_reset(struct virtio_device *vdev)
 		msleep(1);
 	/* Disable VQ/configuration callbacks. */
 	vp_disable_cbs(vdev);
+}
+
+static int vp_modern_reset_vq(struct virtio_device *vdev, u16 queue_index)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	u16 msix_vec;
+
+	if (!virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+		return -ENOENT;
+
+	vp_modern_set_queue_reset(mdev, queue_index);
+
+	/* After write 1 to queue reset, the driver MUST wait for a read of
+	 * queue reset to return 1.
+	 */
+	while (vp_modern_get_queue_reset(mdev, queue_index) != 1)
+		msleep(1);
+
+	msix_vec = vp_dev->vqs[queue_index]->msix_vector;
+
+	/* Disable VQ callback. */
+	if (vp_dev->per_vq_vectors && msix_vec != VIRTIO_MSI_NO_VECTOR)
+		disable_irq(pci_irq_vector(vp_dev->pci_dev, msix_vec));
+
+	return 0;
+}
+
+static int vp_modern_del_reset_vq(struct virtio_device *vdev, u16 queue_index)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+
+	if (!virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+		return -ENOENT;
+
+	/* check queue reset status */
+	if (vp_modern_get_queue_reset(mdev, queue_index) != 1)
+		return -EBUSY;
+
+	return vp_del_reset_vq(vdev, queue_index);
+}
+
+static struct virtqueue *vp_modern_enable_reset_vq(struct virtio_device *vdev,
+						   u16 queue_index,
+						   vq_callback_t *callback,
+						   const char *name,
+						   const bool *ctx)
+{
+	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
+	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+	struct virtqueue *vq;
+	u16 msix_vec;
+
+	if (!virtio_has_feature(vdev, VIRTIO_F_RING_RESET))
+		return ERR_PTR(-ENOENT);
+
+	/* check queue reset status */
+	if (vp_modern_get_queue_reset(mdev, queue_index) != 1)
+		return ERR_PTR(-EBUSY);
+
+	vq = vp_enable_reset_vq(vdev, queue_index, callback, name, ctx);
+	if (IS_ERR(vq))
+		return vq;
+
+	vp_modern_set_queue_enable(&vp_dev->mdev, vq->index, true);
+
+	msix_vec = vp_dev->vqs[queue_index]->msix_vector;
+	if (vp_dev->per_vq_vectors && msix_vec != VIRTIO_MSI_NO_VECTOR)
+		enable_irq(pci_irq_vector(vp_dev->pci_dev, msix_vec));
+
+	return vq;
 }
 
 static u16 vp_config_vector(struct virtio_pci_device *vp_dev, u16 vector)
@@ -395,6 +470,9 @@ static const struct virtio_config_ops virtio_pci_config_nodev_ops = {
 	.set_vq_affinity = vp_set_vq_affinity,
 	.get_vq_affinity = vp_get_vq_affinity,
 	.get_shm_region  = vp_get_shm_region,
+	.reset_vq	 = vp_modern_reset_vq,
+	.del_reset_vq    = vp_modern_del_reset_vq,
+	.enable_reset_vq = vp_modern_enable_reset_vq,
 };
 
 static const struct virtio_config_ops virtio_pci_config_ops = {
@@ -413,6 +491,9 @@ static const struct virtio_config_ops virtio_pci_config_ops = {
 	.set_vq_affinity = vp_set_vq_affinity,
 	.get_vq_affinity = vp_get_vq_affinity,
 	.get_shm_region  = vp_get_shm_region,
+	.reset_vq	 = vp_modern_reset_vq,
+	.del_reset_vq    = vp_modern_del_reset_vq,
+	.enable_reset_vq = vp_modern_enable_reset_vq,
 };
 
 /* the PCI probing function */
